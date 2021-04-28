@@ -30,8 +30,11 @@ static const char *fast_export_usage[] = {
 	NULL
 };
 
+enum sign_mode { SIGN_ABORT, SIGN_VERBATIM, SIGN_STRIP, SIGN_VERBATIM_WARN, SIGN_STRIP_WARN };
+
 static int progress;
-static enum { SIGNED_TAG_ABORT, VERBATIM, WARN, WARN_STRIP, STRIP } signed_tag_mode = SIGNED_TAG_ABORT;
+static enum sign_mode signed_tag_mode = SIGN_ABORT;
+static enum sign_mode signed_commit_mode = SIGN_STRIP_WARN;
 static enum { TAG_FILTERING_ABORT, DROP, REWRITE } tag_of_filtered_mode = TAG_FILTERING_ABORT;
 static enum { REENCODE_ABORT, REENCODE_YES, REENCODE_NO } reencode_mode = REENCODE_ABORT;
 static int fake_missing_tagger;
@@ -48,21 +51,24 @@ static int anonymize;
 static struct hashmap anonymized_seeds;
 static struct revision_sources revision_sources;
 
-static int parse_opt_signed_tag_mode(const struct option *opt,
+static int parse_opt_sign_mode(const struct option *opt,
 				     const char *arg, int unset)
 {
-	if (unset || !strcmp(arg, "abort"))
-		signed_tag_mode = SIGNED_TAG_ABORT;
+	enum sign_mode *valptr = opt->value;
+	if (unset)
+		return 0;
+	else if (!strcmp(arg, "abort"))
+		*valptr = SIGN_ABORT;
 	else if (!strcmp(arg, "verbatim") || !strcmp(arg, "ignore"))
-		signed_tag_mode = VERBATIM;
-	else if (!strcmp(arg, "warn"))
-		signed_tag_mode = WARN;
+		*valptr = SIGN_VERBATIM;
+	else if (!strcmp(arg, "warn-verbatim") || !strcmp(arg, "warn"))
+		*valptr = SIGN_VERBATIM_WARN;
 	else if (!strcmp(arg, "warn-strip"))
-		signed_tag_mode = WARN_STRIP;
+		*valptr = SIGN_STRIP_WARN;
 	else if (!strcmp(arg, "strip"))
-		signed_tag_mode = STRIP;
+		*valptr = SIGN_STRIP;
 	else
-		return error("Unknown signed-tags mode: %s", arg);
+		return error("Unknown %s mode: %s", opt->long_name, arg);
 	return 0;
 }
 
@@ -499,6 +505,60 @@ static void show_filemodify(struct diff_queue_struct *q,
 	}
 }
 
+static const char *find_signature(const char *begin, const char *end, const char *key)
+{
+	static struct strbuf needle = STRBUF_INIT;
+	char *bod, *eod, *eol;
+
+	strbuf_reset(&needle);
+	strbuf_addch(&needle, '\n');
+	strbuf_addstr(&needle, key);
+	strbuf_addch(&needle, ' ');
+
+	bod = memmem(begin, end ? end - begin : strlen(begin),
+		     needle.buf, needle.len);
+	if (!bod)
+		return NULL;
+	bod += needle.len;
+
+	/*
+	 * In the commit object, multi-line header values are stored
+	 * by prefixing continuation lines begin with a space.  So
+	 * within the commit object, it looks like
+	 *
+	 *     "gpgsig -----BEGIN PGP SIGNATURE-----\n"
+	 *     " Version: GnuPG v1.4.5 (GNU/Linux)\n"
+	 *     " \n"
+	 *     " base64_pem_here\n"
+	 *     " -----END PGP SIGNATURE-----\n"
+	 *
+	 * So we need to look for the first '\n' that *isn't* followed
+	 * by a ' ' (or the first '\0', if no such '\n' exists).
+	 */
+	eod = strchrnul(bod, '\n');
+	while (eod[0] == '\n' && eod[1] == ' ') {
+		eod = strchrnul(eod+1, '\n');
+	}
+	*eod = '\0';
+
+	/*
+	 * We now have the value as it's stored in the commit object.
+	 * However, we want the raw value; we want to return
+	 *
+	 *     "-----BEGIN PGP SIGNATURE-----\n"
+	 *     "Version: GnuPG v1.4.5 (GNU/Linux)\n"
+	 *     "\n"
+	 *     "base64_pem_here\n"
+	 *     "-----END PGP SIGNATURE-----\n"
+	 *
+	 * So now we need to strip out all of those extra spaces.
+	 */
+	while ((eol = strstr(bod, "\n ")))
+		memmove(eol+1, eol+2, strlen(eol+1));
+
+	return bod;
+}
+
 static const char *find_encoding(const char *begin, const char *end)
 {
 	const char *needle = "\nencoding ";
@@ -621,6 +681,7 @@ static void handle_commit(struct commit *commit, struct rev_info *rev,
 	int saved_output_format = rev->diffopt.output_format;
 	const char *commit_buffer;
 	const char *author, *author_end, *committer, *committer_end;
+	const char *signature_alg = NULL, *signature;
 	const char *encoding, *message;
 	char *reencoded = NULL;
 	struct commit_list *p;
@@ -644,6 +705,10 @@ static void handle_commit(struct commit *commit, struct rev_info *rev,
 	committer++;
 	committer_end = strchrnul(committer, '\n');
 	message = strstr(committer_end, "\n\n");
+	if ((signature = find_signature(committer_end, message, "gpgsig")))
+		signature_alg = "sha1";
+	else if ((signature = find_signature(committer_end, message, "gpgsig-sha256")))
+		signature_alg = "sha256";
 	encoding = find_encoding(committer_end, message);
 	if (message)
 		message += 2;
@@ -703,6 +768,29 @@ static void handle_commit(struct commit *commit, struct rev_info *rev,
 	printf("%.*s\n%.*s\n",
 	       (int)(author_end - author), author,
 	       (int)(committer_end - committer), committer);
+	if (signature)
+		switch(signed_commit_mode) {
+		case SIGN_ABORT:
+			die("encountered signed commit %s",
+			    oid_to_hex(&commit->object.oid));
+		case SIGN_VERBATIM_WARN:
+			warning("exporting signed commit %s",
+				oid_to_hex(&commit->object.oid));
+			/* fallthru */
+		case SIGN_VERBATIM:
+			printf("gpgsig %s\ndata %u\n%s",
+			       signature_alg,
+			       (unsigned)strlen(signature),
+			       signature);
+			break;
+		case SIGN_STRIP_WARN:
+			warning("stripping signature from commit %s; use"
+				"--signed-commits=<mode> to handle it differently",
+				oid_to_hex(&commit->object.oid));
+			/* fallthru */
+		case SIGN_STRIP:
+			break;
+		}
 	if (!reencoded && encoding)
 		printf("encoding %s\n", encoding);
 	printf("data %u\n%s",
@@ -830,21 +918,21 @@ static void handle_tag(const char *name, struct tag *tag)
 					       "\n-----BEGIN PGP SIGNATURE-----\n");
 		if (signature)
 			switch(signed_tag_mode) {
-			case SIGNED_TAG_ABORT:
+			case SIGN_ABORT:
 				die("encountered signed tag %s; use "
 				    "--signed-tags=<mode> to handle it",
 				    oid_to_hex(&tag->object.oid));
-			case WARN:
+			case SIGN_VERBATIM_WARN:
 				warning("exporting signed tag %s",
 					oid_to_hex(&tag->object.oid));
 				/* fallthru */
-			case VERBATIM:
+			case SIGN_VERBATIM:
 				break;
-			case WARN_STRIP:
+			case SIGN_STRIP_WARN:
 				warning("stripping signature from tag %s",
 					oid_to_hex(&tag->object.oid));
 				/* fallthru */
-			case STRIP:
+			case SIGN_STRIP:
 				message_size = signature + 1 - message;
 				break;
 			}
@@ -1197,7 +1285,10 @@ int cmd_fast_export(int argc, const char **argv, const char *prefix)
 			    N_("show progress after <n> objects")),
 		OPT_CALLBACK(0, "signed-tags", &signed_tag_mode, N_("mode"),
 			     N_("select handling of signed tags"),
-			     parse_opt_signed_tag_mode),
+			     parse_opt_sign_mode),
+		OPT_CALLBACK(0, "signed-commits", &signed_commit_mode, N_("mode"),
+			     N_("select handling of signed commits"),
+			     parse_opt_sign_mode),
 		OPT_CALLBACK(0, "tag-of-filtered-object", &tag_of_filtered_mode, N_("mode"),
 			     N_("select handling of tags that tag filtered objects"),
 			     parse_opt_tag_of_filtered_mode),
