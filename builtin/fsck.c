@@ -602,7 +602,7 @@ static int fsck_loose(const struct object_id *oid, const char *path, void *data)
 	struct strbuf sb = STRBUF_INIT;
 	unsigned int oi_flags = OBJECT_INFO_ALLOW_UNKNOWN_TYPE;
 	struct object_info oi;
-	struct object_id real_oid = null_oid;
+	struct object_id real_oid = *null_oid();
 	int found = 0;
 	oi.type_name = &sb;
 	oi.sizep = &size;

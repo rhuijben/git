@@ -80,7 +80,7 @@ static int do_merge_one_file(struct index_state *istate,
 		read_mmblob(mmfs + 0, orig_blob);
 	} else {
 		printf(_("Added %s in both, but differently.\n"), path);
-		read_mmblob(mmfs + 0, &null_oid);
+		read_mmblob(mmfs + 0, null_oid());
 	}
 
 	read_mmblob(mmfs + 1, our_blob);
